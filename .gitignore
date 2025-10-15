@@ -482,3 +482,8 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# VideoLoop project artifacts
+publish-test/
+VideoLoop/publish/
+installer/publish-temp/
