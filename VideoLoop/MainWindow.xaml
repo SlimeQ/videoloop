@@ -4,17 +4,41 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         mc:Ignorable="d"
         Title="Video Loop"
         Height="360"
         Width="640"
+        MinWidth="240"
+        MinHeight="135"
         WindowStartupLocation="CenterScreen"
-        ResizeMode="CanResizeWithGrip"
-        Topmost="True">
-    <Grid Background="Black">
+        ResizeMode="CanResize"
+        WindowStyle="None"
+        Topmost="True"
+        Background="Black">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+    </Window.Resources>
+
+    <WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0"
+                            ResizeBorderThickness="8"
+                            GlassFrameThickness="0"
+                            CornerRadius="0"
+                            UseAeroCaptionButtons="False" />
+    </WindowChrome.WindowChrome>
+
+    <Grid x:Name="RootGrid"
+          Background="Black"
+          MouseLeftButtonDown="RootGrid_OnMouseLeftButtonDown"
+          MouseMove="RootGrid_OnMouseMove"
+          MouseEnter="RootGrid_OnMouseEnter"
+          MouseLeave="RootGrid_OnMouseLeave">
         <vlc:VideoView x:Name="VideoViewControl"
                        HorizontalAlignment="Stretch"
-                       VerticalAlignment="Stretch" />
+                       VerticalAlignment="Stretch"
+                       IsHitTestVisible="False"
+                       Focusable="False" />
         <Border x:Name="StatusPanel"
                 Background="#99000000"
                 CornerRadius="4"
@@ -29,5 +53,53 @@
                        FontSize="16"
                        FontWeight="SemiBold" />
         </Border>
+        <Grid x:Name="ControlsOverlay"
+              Margin="24"
+              VerticalAlignment="Bottom"
+              Panel.ZIndex="1"
+              Opacity="0"
+              Visibility="Collapsed"
+              shell:WindowChrome.IsHitTestVisibleInChrome="False">
+            <Border Background="#AA000000"
+                    CornerRadius="8"
+                    Padding="16">
+                <StackPanel Orientation="Vertical"
+                            MinWidth="280">
+                    <Slider x:Name="TimelineSlider"
+                            Margin="0,0,0,12"
+                            Minimum="0"
+                            Maximum="1"
+                            ValueChanged="OnTimelineSliderValueChanged"
+                            PreviewMouseLeftButtonDown="TimelineSlider_OnPreviewMouseLeftButtonDown"
+                            PreviewMouseLeftButtonUp="TimelineSlider_OnPreviewMouseLeftButtonUp"
+                            LostMouseCapture="OnTimelineSliderLostMouseCapture"
+                            IsMoveToPointEnabled="True"
+                            shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                    <StackPanel Orientation="Horizontal"
+                                HorizontalAlignment="Center">
+                        <Button x:Name="PreviousButton"
+                                Content="Prev"
+                                Width="48"
+                                Height="32"
+                                Margin="0,0,16,0"
+                                Click="OnPreviousClicked"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                        <Button x:Name="PlayPauseButton"
+                                Content="Play"
+                                Width="64"
+                                Height="32"
+                                Margin="0,0,16,0"
+                                Click="OnPlayPauseClicked"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                        <Button x:Name="NextButton"
+                                Content="Next"
+                                Width="48"
+                                Height="32"
+                                Click="OnNextClicked"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
     </Grid>
 </Window>
