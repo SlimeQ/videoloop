@@ -58,7 +58,6 @@ public partial class MainWindow : Window
     private bool _isSliderDragging;
     private bool _isUpdatingTimeline;
     private bool _isSeekable;
-    private bool _isPointerOverWindow;
 
     public MainWindow()
     {
@@ -437,7 +436,7 @@ public partial class MainWindow : Window
 
     private void HideControlsOverlay(bool force = false)
     {
-        if (!force && _isPointerOverWindow)
+        if (!force && _isSliderDragging)
         {
             return;
         }
@@ -707,8 +706,6 @@ public partial class MainWindow : Window
 
     private void RootGrid_OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        _isPointerOverWindow = true;
-
         if (IsInteractiveElement(e.OriginalSource as DependencyObject))
         {
             ShowControlsOverlay(autoHide: false);
@@ -720,7 +717,7 @@ public partial class MainWindow : Window
             return;
         }
 
-            ShowControlsOverlay(autoHide: false);
+        ShowControlsOverlay();
 
         try
         {
@@ -916,27 +913,13 @@ public partial class MainWindow : Window
         _mediaPlayer.Position = target;
     }
 
-    private void RootGrid_OnMouseEnter(object sender, InputMouseEventArgs e)
-    {
-        _isPointerOverWindow = true;
-        ShowControlsOverlay();
-    }
-
-    private void RootGrid_OnMouseMove(object sender, InputMouseEventArgs e)
-    {
-        _isPointerOverWindow = true;
-        ShowControlsOverlay();
-    }
-
     private void RootGrid_OnMouseLeave(object sender, InputMouseEventArgs e)
     {
-        _isPointerOverWindow = false;
         if (_isSliderDragging)
         {
             return;
         }
 
-        _overlayHideTimer.Stop();
         HideControlsOverlay(force: true);
     }
 

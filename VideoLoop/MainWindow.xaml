@@ -13,27 +13,17 @@
         MinHeight="135"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResize"
-        WindowStyle="None"
-        Topmost="True"
+        WindowStyle="SingleBorderWindow"
         Background="Black">
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
     </Window.Resources>
 
-    <WindowChrome.WindowChrome>
-        <shell:WindowChrome CaptionHeight="0"
-                            ResizeBorderThickness="8"
-                            GlassFrameThickness="0"
-                            CornerRadius="0"
-                            UseAeroCaptionButtons="False" />
-    </WindowChrome.WindowChrome>
-
     <Grid x:Name="RootGrid"
           Background="Black"
           MouseLeftButtonDown="RootGrid_OnMouseLeftButtonDown"
-          MouseMove="RootGrid_OnMouseMove"
-          MouseEnter="RootGrid_OnMouseEnter"
-          MouseLeave="RootGrid_OnMouseLeave">
+          MouseLeave="RootGrid_OnMouseLeave"
+          shell:WindowChrome.IsHitTestVisibleInChrome="True">
         <vlc:VideoView x:Name="VideoViewControl"
                        HorizontalAlignment="Stretch"
                        VerticalAlignment="Stretch"
@@ -59,7 +49,7 @@
               Panel.ZIndex="1"
               Opacity="0"
               Visibility="Collapsed"
-              shell:WindowChrome.IsHitTestVisibleInChrome="False">
+              shell:WindowChrome.IsHitTestVisibleInChrome="True">
             <Border Background="#AA000000"
                     CornerRadius="8"
                     Padding="16">
@@ -74,7 +64,7 @@
                             PreviewMouseLeftButtonUp="TimelineSlider_OnPreviewMouseLeftButtonUp"
                             LostMouseCapture="OnTimelineSliderLostMouseCapture"
                             IsMoveToPointEnabled="True"
-                            shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                            shell:WindowChrome.IsHitTestVisibleInChrome="True" />
                     <StackPanel Orientation="Horizontal"
                                 HorizontalAlignment="Center">
                         <Button x:Name="PreviousButton"
@@ -83,20 +73,20 @@
                                 Height="32"
                                 Margin="0,0,16,0"
                                 Click="OnPreviousClicked"
-                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True" />
                         <Button x:Name="PlayPauseButton"
                                 Content="Play"
                                 Width="64"
                                 Height="32"
                                 Margin="0,0,16,0"
                                 Click="OnPlayPauseClicked"
-                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True" />
                         <Button x:Name="NextButton"
                                 Content="Next"
                                 Width="48"
                                 Height="32"
                                 Click="OnNextClicked"
-                                shell:WindowChrome.IsHitTestVisibleInChrome="False" />
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True" />
                     </StackPanel>
                 </StackPanel>
             </Border>
