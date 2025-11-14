@@ -2,31 +2,30 @@
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Text.Json;
+using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
 using System.Windows.Interop;
-using System.Windows.Shell;
-using System.Windows.Threading;
-using LibVLCSharp.Shared;
 using Forms = System.Windows.Forms;
-using InputMouseEventArgs = System.Windows.Input.MouseEventArgs;
-using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
-using VisualTreeHelper = System.Windows.Media.VisualTreeHelper;
-using WindowsSize = System.Windows.Size;
-using VlcMediaPlayer = LibVLCSharp.Shared.MediaPlayer;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.AspNetCore.StaticFiles;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace VideoLoop;
 
 public partial class MainWindow : Window
 {
     private const string SpotFileName = ".spot";
-    private const string PlayLabel = "Play";
-    private const string PauseLabel = "Pause";
 
     private static readonly HashSet<string> SupportedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -40,57 +39,21 @@ public partial class MainWindow : Window
         ".mkv"
     };
 
-    private static bool _libVlcInitialized;
-    private static Exception? _libVlcInitException;
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    private readonly DispatcherTimer _retryTimer = new();
-    private readonly DispatcherTimer _overlayHideTimer;
-
-    private LibVLC? _libVLC;
-    private VlcMediaPlayer? _mediaPlayer;
-    private Media? _currentMedia;
-    private List<string> _playlist = new();
-    private int _currentIndex = -1;
     private string? _selectedFolder;
-    private double? _videoAspectRatio;
-    private bool _isAdjustingSize;
-    private WindowsSize _lastSize;
-    private bool _isSliderDragging;
-    private bool _isUpdatingTimeline;
-    private bool _isSeekable;
+    private List<string> _playlist = new();
+    private WebApplication? _webApp;
+    private string? _serverUrl;
+    private ServerCoordinator? _coordinator;
 
     public MainWindow()
     {
         InitializeComponent();
-
         Loaded += OnLoaded;
-        Closing += OnClosing;
-        SizeChanged += OnWindowSizeChanged;
-
-        _retryTimer.Interval = TimeSpan.FromSeconds(1);
-        _retryTimer.Tick += (_, _) =>
-        {
-            _retryTimer.Stop();
-            AdvanceToNextVideo();
-        };
-
-        _overlayHideTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromSeconds(3)
-        };
-        _overlayHideTimer.Tick += (_, _) =>
-        {
-            _overlayHideTimer.Stop();
-            HideControlsOverlay();
-        };
-
-        _lastSize = new WindowsSize(Width, Height);
-        ResetTimeline();
-        UpdatePlaybackControls();
-        HideControlsOverlay();
     }
 
-    private void OnLoaded(object sender, RoutedEventArgs e)
+    private async void OnLoaded(object? sender, RoutedEventArgs e)
     {
         Loaded -= OnLoaded;
 
@@ -102,21 +65,39 @@ public partial class MainWindow : Window
 
         if (!BuildPlaylist())
         {
-            ShowStatus("No playable videos were found in the selected folder.");
-            UpdatePlaybackControls();
+            ShowError("No playable videos were found in the selected folder.");
             return;
         }
 
-        UpdatePlaybackControls();
+        var spotSnapshot = LoadSpotSnapshot();
+        _coordinator = new ServerCoordinator(_playlist, _selectedFolder!, spotSnapshot);
 
-        if (!EnsurePlayerInitialized())
+        try
         {
+            await StartWebServerAsync(_coordinator);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"Unable to start the web server: {ex.Message}");
             return;
         }
 
-        LoadLastPlayed();
-        PlayCurrentVideo();
-        ShowControlsOverlay();
+        if (string.IsNullOrWhiteSpace(_serverUrl))
+        {
+            ShowError("The web server started but no address was reported.");
+            return;
+        }
+
+        InstructionText.Text = "Keep this window open while the browser player is running.";
+        ShowStatus("Serving videos to your browser.");
+        ShowServerDetails(_serverUrl);
+        OpenBrowser(_serverUrl);
+    }
+
+    protected override async void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        await StopWebServerAsync();
     }
 
     private bool TrySelectFolder()
@@ -135,9 +116,9 @@ public partial class MainWindow : Window
             {
                 fullPath = Path.GetFullPath(expanded);
             }
-            catch (Exception ex)
+            catch
             {
-                Debug.WriteLine($"Unable to resolve path from argument '{arg}': {ex}");
+                fullPath = expanded;
             }
 
             if (fullPath is not null && Directory.Exists(fullPath))
@@ -221,719 +202,677 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowStatus($"Unable to read the folder: {ex.Message}");
+            Debug.WriteLine($"Unable to read the folder: {ex}");
             _playlist.Clear();
         }
 
         return _playlist.Count > 0;
     }
 
-    private void LoadLastPlayed()
+    private SpotSnapshot LoadSpotSnapshot()
     {
         if (_selectedFolder is null || _playlist.Count == 0)
         {
-            _currentIndex = 0;
-            return;
+            return new SpotSnapshot(0, 0);
         }
 
         var spotPath = Path.Combine(_selectedFolder, SpotFileName);
         if (!File.Exists(spotPath))
         {
-            _currentIndex = 0;
-            return;
+            return new SpotSnapshot(0, 0);
         }
 
         try
         {
-            var spotEntry = File.ReadAllText(spotPath).Trim();
-            if (!string.IsNullOrEmpty(spotEntry))
+            var content = File.ReadAllText(spotPath).Trim();
+            if (string.IsNullOrEmpty(content))
             {
-                var matchIndex = _playlist.FindIndex(path =>
-                    string.Equals(Path.GetFileName(path), spotEntry, StringComparison.OrdinalIgnoreCase));
+                return new SpotSnapshot(0, 0);
+            }
 
-                _currentIndex = matchIndex >= 0 ? matchIndex : 0;
-            }
-            else
+            var parts = content.Split('|', 2);
+            var fileName = parts[0].Trim();
+            var matchIndex = _playlist.FindIndex(path =>
+                string.Equals(Path.GetFileName(path), fileName, StringComparison.OrdinalIgnoreCase));
+
+            if (matchIndex < 0)
             {
-                _currentIndex = 0;
+                return new SpotSnapshot(0, 0);
             }
+
+            var position = 0.0;
+            if (parts.Length > 1)
+            {
+                var positionText = parts[1].Trim();
+                if (double.TryParse(positionText, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) &&
+                    parsed > 0)
+                {
+                    position = parsed;
+                }
+            }
+
+            return new SpotSnapshot(matchIndex, position);
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"Failed to read .spot file: {ex}");
-            _currentIndex = 0;
+            return new SpotSnapshot(0, 0);
         }
     }
 
-    private bool EnsurePlayerInitialized()
+    private async Task StartWebServerAsync(ServerCoordinator coordinator)
     {
-        if (_mediaPlayer is not null && _libVLC is not null)
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
         {
-            return true;
-        }
+            Args = Array.Empty<string>()
+        });
 
-        if (!TryInitializeLibVlc(out var error))
+        builder.WebHost.ConfigureKestrel(options =>
         {
-            ShowStatus(error ?? "Unable to locate LibVLC runtime.");
-            return false;
-        }
-
-        try
-        {
-            _libVLC = new LibVLC();
-            _mediaPlayer = new MediaPlayer(_libVLC);
-            _mediaPlayer.EndReached += OnMediaEnded;
-            _mediaPlayer.EncounteredError += OnMediaEncounteredError;
-            _mediaPlayer.Playing += OnMediaPlaying;
-            _mediaPlayer.Paused += OnMediaPaused;
-            _mediaPlayer.Stopped += OnMediaStopped;
-            _mediaPlayer.Vout += OnMediaVout;
-            _mediaPlayer.PositionChanged += OnMediaPositionChanged;
-            _mediaPlayer.TimeChanged += OnMediaTimeChanged;
-            _mediaPlayer.SeekableChanged += OnMediaSeekableChanged;
-            VideoViewControl.MediaPlayer = _mediaPlayer;
-            UpdatePlaybackControls();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            ShowStatus($"Unable to initialize video playback: {ex.Message}");
-            return false;
-        }
-    }
-
-    private void PlayCurrentVideo()
-    {
-        if (_playlist.Count == 0)
-        {
-            return;
-        }
-
-        if (_currentIndex < 0 || _currentIndex >= _playlist.Count)
-        {
-            _currentIndex = 0;
-        }
-
-        if (!EnsurePlayerInitialized())
-        {
-            return;
-        }
-
-        if (_mediaPlayer is null || _libVLC is null)
-        {
-            return;
-        }
-
-        var path = _playlist[_currentIndex];
-
-        try
-        {
-            HideStatus();
-            _retryTimer.Stop();
-            _videoAspectRatio = null;
-            _isSeekable = false;
-            ResetTimeline();
-            _mediaPlayer.Stop();
-
-            _currentMedia?.Dispose();
-            _currentMedia = new Media(_libVLC, path, FromType.FromPath);
-
-            if (!_mediaPlayer.Play(_currentMedia))
+            options.Listen(IPAddress.Loopback, 0, listenOptions =>
             {
-                throw new InvalidOperationException("LibVLC was unable to start playback.");
+                listenOptions.Protocols = HttpProtocols.Http1;
+            });
+        });
+
+        builder.Services.AddSingleton(coordinator);
+        builder.Services.AddSingleton<FileExtensionContentTypeProvider>();
+
+        var app = builder.Build();
+
+        app.MapGet("/", () => Results.Content(BuildHtml(), "text/html; charset=utf-8"));
+
+        app.MapGet("/api/state", (ServerCoordinator state) => Results.Json(state.CreateStateDto()));
+
+        app.MapPost("/api/spot", async (HttpContext context, ServerCoordinator state) =>
+        {
+            var payload = await context.Request.ReadFromJsonAsync<SpotUpdatePayload>(JsonOptions);
+            if (payload is null)
+            {
+                return Results.BadRequest();
             }
 
-            PersistSpot();
-            UpdatePlaybackControls();
-            Dispatcher.BeginInvoke(new Action(() => ShowControlsOverlay()));
-        }
-        catch (Exception ex)
+            state.UpdateSpot(payload.Index, payload.PositionSeconds);
+            return Results.Ok();
+        });
+
+        app.MapMethods("/media/{index:int}", new[] { HttpMethods.Get, HttpMethods.Head }, (int index, HttpContext context, ServerCoordinator state, FileExtensionContentTypeProvider provider) =>
         {
-            ShowStatus($"Cannot play {Path.GetFileName(path)}: {ex.Message}");
-            ScheduleAdvance();
-            UpdatePlaybackControls();
-        }
-    }
+            if (!state.TryGetVideo(index, out var video))
+            {
+                return Results.NotFound();
+            }
 
-    private void AdvanceToNextVideo()
-    {
-        if (_playlist.Count == 0)
-        {
-            return;
-        }
+            if (!provider.TryGetContentType(video.Path, out var contentType))
+            {
+                contentType = "application/octet-stream";
+            }
 
-        _currentIndex = (_currentIndex + 1) % _playlist.Count;
-        PlayCurrentVideo();
-    }
-
-    private void GoToPreviousVideo()
-    {
-        if (_playlist.Count == 0)
-        {
-            return;
-        }
-
-        _currentIndex = (_currentIndex - 1 + _playlist.Count) % _playlist.Count;
-        PlayCurrentVideo();
-    }
-
-    private void ScheduleAdvance()
-    {
-        if (_retryTimer.IsEnabled)
-        {
-            return;
-        }
-
-        _retryTimer.Start();
-    }
-
-    private void PersistSpot()
-    {
-        if (_selectedFolder is null || _playlist.Count == 0 || _currentIndex < 0)
-        {
-            return;
-        }
-
-        var spotPath = Path.Combine(_selectedFolder, SpotFileName);
+            context.Response.Headers["Accept-Ranges"] = "bytes";
+            return Results.File(video.Path, contentType, enableRangeProcessing: true);
+        });
 
         try
         {
-            File.WriteAllText(spotPath, Path.GetFileName(_playlist[_currentIndex]));
+            await app.StartAsync();
+        }
+        catch
+        {
+            await app.DisposeAsync();
+            throw;
+        }
+
+        var addressesFeature = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>();
+        _serverUrl = addressesFeature?.Addresses.FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(_serverUrl) && app.Urls.Count > 0)
+        {
+            _serverUrl = app.Urls.First();
+        }
+
+        _webApp = app;
+    }
+
+    private async Task StopWebServerAsync()
+    {
+        if (_webApp is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _webApp.StopAsync();
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Failed to write .spot file: {ex}");
+            Debug.WriteLine($"Failed to stop the web server: {ex}");
+        }
+        finally
+        {
+            await _webApp.DisposeAsync();
+            _webApp = null;
+            _serverUrl = null;
         }
     }
 
     private void ShowStatus(string message)
     {
         StatusText.Text = message;
-        StatusPanel.Visibility = Visibility.Visible;
-        ShowControlsOverlay();
     }
 
-    private void HideStatus()
+    private void ShowError(string message)
     {
-        StatusPanel.Visibility = Visibility.Collapsed;
+        ShowStatus(message);
+        ServerUrlText.Visibility = Visibility.Collapsed;
+        OpenBrowserButton.Visibility = Visibility.Collapsed;
     }
 
-    private void ShowControlsOverlay(bool autoHide = true)
+    private void ShowServerDetails(string address)
     {
-        ControlsOverlay.Visibility = Visibility.Visible;
-        ControlsOverlay.Opacity = 1;
+        ServerUrlText.Text = address;
+        ServerUrlText.Visibility = Visibility.Visible;
+        OpenBrowserButton.Visibility = Visibility.Visible;
+    }
 
-        if (autoHide)
+    private void OnOpenBrowserClicked(object sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(_serverUrl))
         {
-            _overlayHideTimer.Stop();
-            _overlayHideTimer.Start();
+            OpenBrowser(_serverUrl);
         }
-        else
+    }
+
+    private static void OpenBrowser(string url)
+    {
+        try
         {
-            _overlayHideTimer.Stop();
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = url,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Unable to open browser: {ex}");
         }
     }
 
-    private void HideControlsOverlay(bool force = false)
+    private static string BuildHtml() =>
+        """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8" />
+          <title>Video Loop Web Player</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+          <style>
+            :root {
+              color-scheme: light dark;
+              font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+            }
+
+            body {
+              margin: 0;
+              padding: 24px;
+              background: #111;
+              color: #f5f5f5;
+            }
+
+            body.light {
+              background: #f5f5f5;
+              color: #111;
+            }
+
+            main {
+              max-width: 920px;
+              margin: 0 auto;
+            }
+
+            h1 {
+              font-size: 1.8rem;
+              margin-bottom: 0.75rem;
+            }
+
+            h2 {
+              font-size: 1.2rem;
+              margin: 1.5rem 0 0.75rem;
+            }
+
+            #info {
+              margin-bottom: 1.5rem;
+              font-size: 1rem;
+            }
+
+            video {
+              width: 100%;
+              max-height: 70vh;
+              background: #000;
+              border-radius: 12px;
+              box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+            }
+
+            #playlist {
+              display: flex;
+              flex-direction: column;
+              gap: 8px;
+            }
+
+            button.playlist-item {
+              text-align: left;
+              padding: 10px 14px;
+              border-radius: 10px;
+              border: 1px solid rgba(255, 255, 255, 0.15);
+              background: rgba(255, 255, 255, 0.06);
+              color: inherit;
+              cursor: pointer;
+              font-size: 1rem;
+              transition: border-color 0.2s ease, background 0.2s ease;
+            }
+
+            button.playlist-item:hover {
+              border-color: rgba(255, 255, 255, 0.35);
+            }
+
+            button.playlist-item.active {
+              border-color: #2f81f7;
+              background: rgba(47, 129, 247, 0.2);
+            }
+
+            body.light button.playlist-item {
+              border: 1px solid rgba(0, 0, 0, 0.1);
+              background: rgba(255, 255, 255, 0.8);
+            }
+
+            body.light button.playlist-item:hover {
+              border-color: rgba(29, 78, 216, 0.35);
+            }
+
+            body.light button.playlist-item.active {
+              border-color: #1d4ed8;
+              background: rgba(29, 78, 216, 0.15);
+            }
+
+            @media (max-width: 640px) {
+              body {
+                padding: 16px;
+              }
+              h1 {
+                font-size: 1.5rem;
+              }
+            }
+          </style>
+        </head>
+        <body>
+          <main>
+            <header>
+              <h1>Video Loop Web Player</h1>
+              <p id="info">Loading playlist...</p>
+            </header>
+            <section>
+              <video id="player" controls playsinline preload="metadata"></video>
+            </section>
+            <section>
+              <h2>Playlist</h2>
+              <div id="playlist"></div>
+            </section>
+          </main>
+          <script>
+            (() => {
+              const state = { videos: [], currentIndex: 0, positionSeconds: 0 };
+              const player = document.getElementById('player');
+              const playlistContainer = document.getElementById('playlist');
+              const info = document.getElementById('info');
+              let lastUpdate = 0;
+              const updateThrottleMs = 5000;
+              const supportNotes = 'Firefox only enables HEVC (H.265) starting with version 134 on Windows (requires hardware support or Microsoft's HEVC Video Extensions), version 136 on macOS, and version 137 on Linux/Android. See MDN: https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Video_codecs#hevc_h.265';
+
+              async function fetchState() {
+                const response = await fetch('/api/state', { cache: 'no-store' });
+                if (!response.ok) {
+                  throw new Error('Failed to load playlist');
+                }
+                return response.json();
+              }
+
+              function renderPlaylist() {
+                playlistContainer.innerHTML = '';
+                state.videos.forEach((video, idx) => {
+                  const button = document.createElement('button');
+                  button.type = 'button';
+                  button.className = 'playlist-item';
+                  button.textContent = video.fileName;
+                  button.addEventListener('click', () => {
+                    setCurrentVideo(idx, false);
+                    player.play().catch(() => {});
+                  });
+                  playlistContainer.appendChild(button);
+                });
+                highlightActive();
+              }
+
+              function highlightActive() {
+                const children = playlistContainer.children;
+                for (let i = 0; i < children.length; i += 1) {
+                  children[i].classList.toggle('active', i === state.currentIndex);
+                }
+              }
+
+              function normalizeIndex(index) {
+                if (state.videos.length === 0) {
+                  return 0;
+                }
+                const modulo = index % state.videos.length;
+                return modulo >= 0 ? modulo : modulo + state.videos.length;
+              }
+
+              function setCurrentVideo(index, restorePosition) {
+                if (state.videos.length === 0) {
+                  return;
+                }
+                const normalized = normalizeIndex(index);
+                state.currentIndex = normalized;
+                const descriptor = state.videos[normalized];
+                state.positionSeconds = restorePosition ? state.positionSeconds : 0;
+                const src = `/media/${descriptor.index}`;
+                if (player.getAttribute('data-current-src') !== src) {
+                  player.setAttribute('data-current-src', src);
+                  player.src = src;
+                }
+                player.load();
+                if (restorePosition && state.positionSeconds > 0) {
+                  const seekTo = Math.max(state.positionSeconds, 0);
+                  const onLoaded = () => {
+                    if (!Number.isNaN(seekTo)) {
+                      try {
+                        player.currentTime = Math.min(seekTo, player.duration || seekTo);
+                      } catch {
+                        // Ignore seek failures until the media is ready.
+                      }
+                    }
+                    player.removeEventListener('loadedmetadata', onLoaded);
+                  };
+                  player.addEventListener('loadedmetadata', onLoaded);
+                }
+                highlightActive();
+                queueUpdate(state.positionSeconds, true);
+              }
+
+              function playNext() {
+                setCurrentVideo(state.currentIndex + 1, false);
+                player.play().catch(() => {});
+              }
+
+              async function queueUpdate(positionSeconds, urgent = false) {
+                if (state.videos.length === 0) {
+                  return;
+                }
+                if (Number.isNaN(positionSeconds) || !Number.isFinite(positionSeconds)) {
+                  positionSeconds = 0;
+                }
+                state.positionSeconds = Math.max(0, positionSeconds);
+                const now = Date.now();
+                if (!urgent && now - lastUpdate < updateThrottleMs) {
+                  return;
+                }
+                lastUpdate = now;
+                const payload = JSON.stringify({
+                  index: state.videos[state.currentIndex].index,
+                  positionSeconds: state.positionSeconds
+                });
+                try {
+                  await fetch('/api/spot', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: payload,
+                    keepalive: urgent
+                  });
+                } catch (error) {
+                  console.warn('Failed to update spot', error);
+                }
+              }
+
+              function flushUpdate() {
+                if (state.videos.length === 0) {
+                  return;
+                }
+                let positionSeconds = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+                if (Number.isNaN(positionSeconds) || !Number.isFinite(positionSeconds)) {
+                  positionSeconds = 0;
+                }
+                const payload = JSON.stringify({
+                  index: state.videos[state.currentIndex].index,
+                  positionSeconds: Math.max(0, positionSeconds)
+                });
+                try {
+                  if (navigator.sendBeacon) {
+                    const blob = new Blob([payload], { type: 'application/json' });
+                    navigator.sendBeacon('/api/spot', blob);
+                  } else {
+                    void fetch('/api/spot', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: payload,
+                      keepalive: true
+                    });
+                  }
+                } catch (error) {
+                  console.warn('Failed to persist spot during unload', error);
+                }
+              }
+
+              function attachPlayerHandlers() {
+                player.addEventListener('timeupdate', () => {
+                  queueUpdate(player.currentTime);
+                });
+                player.addEventListener('pause', () => {
+                  queueUpdate(player.currentTime, true);
+                });
+                player.addEventListener('ended', () => {
+                  queueUpdate(0, true);
+                  playNext();
+                });
+                player.addEventListener('error', () => {
+                  const mediaError = player.error;
+                  const parts = ['Playback failed.'];
+                  if (mediaError) {
+                    if (mediaError.message) {
+                      parts.push(mediaError.message);
+                    }
+                    if (typeof MediaError !== 'undefined') {
+                      switch (mediaError.code) {
+                        case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
+                          parts.push('This browser reported that the file format or codec is not supported.');
+                          break;
+                        case MediaError.MEDIA_ERR_NETWORK:
+                          parts.push('The video could not be loaded due to a network error.');
+                          break;
+                        case MediaError.MEDIA_ERR_DECODE:
+                          parts.push('There was an error decoding the media data.');
+                          break;
+                        default:
+                          break;
+                      }
+                    }
+                  }
+                  parts.push(supportNotes);
+                  info.textContent = parts.join(' ');
+                  info.dataset.state = 'error';
+                });
+                window.addEventListener('beforeunload', flushUpdate);
+                document.addEventListener('visibilitychange', () => {
+                  if (document.visibilityState === 'hidden') {
+                    flushUpdate();
+                  }
+                });
+              }
+
+              async function bootstrap() {
+                try {
+                  const data = await fetchState();
+                  state.videos = data.videos ?? [];
+                  state.currentIndex = data.currentIndex ?? 0;
+                  state.positionSeconds = data.positionSeconds ?? 0;
+                  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+                    document.body.classList.add('light');
+                  }
+                  if (state.videos.length === 0) {
+                    info.textContent = 'No playable videos were found.';
+                    player.removeAttribute('src');
+                    return;
+                  }
+                  info.textContent = 'Ready. The playlist will loop automatically.';
+                  renderPlaylist();
+                  attachPlayerHandlers();
+                  setCurrentVideo(state.currentIndex, true);
+                  player.play().catch(() => {});
+                } catch (error) {
+                  console.error(error);
+                  info.textContent = 'Unable to load the playlist. Check the desktop app for details.';
+                }
+              }
+
+              bootstrap();
+            })();
+          </script>
+        </body>
+        </html>
+        """;
+
+    private sealed class ServerCoordinator
     {
-        if (!force && _isSliderDragging)
+        private readonly object _gate = new();
+        private readonly string _spotPath;
+        private readonly List<VideoDescriptor> _videos;
+        private int _currentIndex;
+        private double _positionSeconds;
+        private int _lastPersistedIndex = -1;
+        private double _lastPersistedPosition = double.NaN;
+        private DateTime _lastPersistUtc = DateTime.MinValue;
+
+        public ServerCoordinator(IEnumerable<string> playlist, string folder, SpotSnapshot snapshot)
         {
-            return;
+            _videos = playlist
+                .Select((path, index) => new VideoDescriptor(index, path, Path.GetFileName(path)))
+                .ToList();
+
+            _spotPath = Path.Combine(folder, SpotFileName);
+            _currentIndex = NormalizeIndex(snapshot.Index);
+            _positionSeconds = Math.Max(0, snapshot.PositionSeconds);
         }
 
-        _overlayHideTimer.Stop();
-        ControlsOverlay.Visibility = Visibility.Collapsed;
-        ControlsOverlay.Opacity = 0;
-    }
-
-    private void OnMediaEnded(object? sender, EventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
+        public bool TryGetVideo(int index, out VideoDescriptor descriptor)
         {
-            ResetTimeline();
-            UpdatePlaybackControls();
-            AdvanceToNextVideo();
-        }));
-    }
+            lock (_gate)
+            {
+                if (index < 0 || index >= _videos.Count)
+                {
+                    descriptor = default;
+                    return false;
+                }
 
-    private void OnMediaEncounteredError(object? sender, EventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
+                descriptor = _videos[index];
+                return true;
+            }
+        }
+
+        public ServerStateResponse CreateStateDto()
         {
-            var currentName = _currentIndex >= 0 && _currentIndex < _playlist.Count
-                ? Path.GetFileName(_playlist[_currentIndex])
-                : "current video";
+            lock (_gate)
+            {
+                var safeIndex = _videos.Count == 0 ? 0 : Math.Clamp(_currentIndex, 0, _videos.Count - 1);
+                return new ServerStateResponse
+                {
+                    Videos = _videos.Select(v => new VideoDto(v.Index, v.FileName)).ToList(),
+                    CurrentIndex = safeIndex,
+                    PositionSeconds = Math.Max(0, _positionSeconds)
+                };
+            }
+        }
 
-            ShowStatus($"Playback failed for {currentName}. Skipping...");
-            ScheduleAdvance();
-            UpdatePlaybackControls();
-        }));
-    }
-
-    private void OnMediaPlaying(object? sender, EventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
+        public void UpdateSpot(int index, double positionSeconds)
         {
-            UpdatePlaybackControls();
-            UpdateAspectRatioFromPlayer();
-            HideControlsOverlay();
-        }));
-    }
+            lock (_gate)
+            {
+                if (_videos.Count == 0)
+                {
+                    return;
+                }
 
-    private void OnMediaPaused(object? sender, EventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
+                if (double.IsNaN(positionSeconds) || double.IsInfinity(positionSeconds))
+                {
+                    positionSeconds = 0;
+                }
+
+                _currentIndex = NormalizeIndex(index);
+                _positionSeconds = Math.Max(0, positionSeconds);
+                PersistSpotLocked();
+            }
+        }
+
+        private void PersistSpotLocked()
         {
-            UpdatePlaybackControls();
-            ShowControlsOverlay(autoHide: false);
-        }));
-    }
-
-    private void OnMediaStopped(object? sender, EventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
-        {
-            UpdatePlaybackControls();
-            ShowControlsOverlay(autoHide: false);
-        }));
-    }
-
-    private void OnMediaVout(object? sender, MediaPlayerVoutEventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(UpdateAspectRatioFromPlayer));
-    }
-
-    private void OnMediaPositionChanged(object? sender, MediaPlayerPositionChangedEventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
-        {
-            if (_isSliderDragging)
+            if (_videos.Count == 0)
             {
                 return;
             }
 
-            SetTimelineValue(e.Position);
-        }));
-    }
+            var safeIndex = Math.Clamp(_currentIndex, 0, _videos.Count - 1);
+            var now = DateTime.UtcNow;
 
-    private void OnMediaTimeChanged(object? sender, MediaPlayerTimeChangedEventArgs e)
-    {
-        // Intentionally left blank; retained for potential future timestamp display.
-    }
-
-    private void OnMediaSeekableChanged(object? sender, MediaPlayerSeekableChangedEventArgs e)
-    {
-        Dispatcher.BeginInvoke(new Action(() =>
-        {
-            _isSeekable = e.Seekable != 0;
-            UpdatePlaybackControls();
-        }));
-    }
-
-    private void OnClosing(object? sender, CancelEventArgs e)
-    {
-        PersistSpot();
-        DisposePlayer();
-    }
-
-    private void DisposePlayer()
-    {
-        _retryTimer.Stop();
-
-        if (_mediaPlayer is not null)
-        {
-            _mediaPlayer.EndReached -= OnMediaEnded;
-            _mediaPlayer.EncounteredError -= OnMediaEncounteredError;
-            _mediaPlayer.Playing -= OnMediaPlaying;
-            _mediaPlayer.Paused -= OnMediaPaused;
-            _mediaPlayer.Stopped -= OnMediaStopped;
-            _mediaPlayer.Vout -= OnMediaVout;
-            _mediaPlayer.PositionChanged -= OnMediaPositionChanged;
-            _mediaPlayer.TimeChanged -= OnMediaTimeChanged;
-            _mediaPlayer.SeekableChanged -= OnMediaSeekableChanged;
-            _mediaPlayer.Stop();
-        }
-
-        VideoViewControl.MediaPlayer = null;
-
-        _currentMedia?.Dispose();
-        _currentMedia = null;
-
-        _mediaPlayer?.Dispose();
-        _mediaPlayer = null;
-
-        _libVLC?.Dispose();
-        _libVLC = null;
-        _isSeekable = false;
-        UpdatePlaybackControls();
-    }
-
-    private static bool TryInitializeLibVlc(out string? error)
-    {
-        if (_libVlcInitialized)
-        {
-            error = null;
-            return true;
-        }
-
-        var baseDir = AppContext.BaseDirectory;
-        var arch = Environment.Is64BitProcess ? "win-x64" : "win-x86";
-
-        static string Combine(params string[] parts) => Path.Combine(parts);
-
-        var searchDirs = new List<string>
-        {
-            baseDir,
-            Combine(baseDir, "libvlc"),
-            Combine(baseDir, "libvlc", arch),
-            Combine(baseDir, "runtimes", arch, "native"),
-            Combine(baseDir, "runtimes", "win", "native")
-        };
-
-        foreach (var dir in searchDirs.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            var libPath = Path.Combine(dir, "libvlc.dll");
-            if (!File.Exists(libPath))
+            if (safeIndex == _lastPersistedIndex &&
+                Math.Abs(_positionSeconds - _lastPersistedPosition) < 0.25 &&
+                now - _lastPersistUtc < TimeSpan.FromSeconds(1))
             {
-                continue;
+                return;
             }
 
-            string? pluginsDir = null;
-
-            var candidatePluginFolders = new[]
-            {
-                Path.Combine(dir, "plugins"),
-                Path.Combine(baseDir, "libvlc", arch, "plugins"),
-                Path.Combine(baseDir, "plugins")
-            };
-
-            foreach (var candidate in candidatePluginFolders)
-            {
-                if (Directory.Exists(candidate))
-                {
-                    pluginsDir = candidate;
-                    break;
-                }
-            }
+            var fileName = _videos[safeIndex].FileName;
+            var payload = $"{fileName}|{_positionSeconds.ToString("F3", CultureInfo.InvariantCulture)}";
 
             try
             {
-                if (pluginsDir is not null)
-                {
-                    Environment.SetEnvironmentVariable("VLC_PLUGIN_PATH", pluginsDir, EnvironmentVariableTarget.Process);
-                }
-
-                Core.Initialize(dir);
-                _libVlcInitialized = true;
-                error = null;
-                return true;
+                File.WriteAllText(_spotPath, payload);
+                _lastPersistedIndex = safeIndex;
+                _lastPersistedPosition = _positionSeconds;
+                _lastPersistUtc = now;
             }
             catch (Exception ex)
             {
-                _libVlcInitException = ex;
+                Debug.WriteLine($"Failed to write .spot file: {ex}");
             }
         }
 
-        error = _libVlcInitException?.Message ?? "libvlc.dll not found in the installation directory.";
-        return false;
-    }
-
-    private void UpdatePlaybackControls()
-    {
-        var hasItems = _playlist.Count > 0;
-        var player = _mediaPlayer;
-        var isPlaying = player?.IsPlaying == true;
-
-        PlayPauseButton.Content = isPlaying ? PauseLabel : PlayLabel;
-        PlayPauseButton.IsEnabled = hasItems && player is not null;
-        PreviousButton.IsEnabled = hasItems;
-        NextButton.IsEnabled = hasItems;
-        TimelineSlider.IsEnabled = hasItems && player is not null && _isSeekable;
-    }
-
-    private void ResetTimeline()
-    {
-        SetTimelineValue(0);
-    }
-
-    private void SetTimelineValue(double value)
-    {
-        _isUpdatingTimeline = true;
-        TimelineSlider.Value = Math.Clamp(value, TimelineSlider.Minimum, TimelineSlider.Maximum);
-        _isUpdatingTimeline = false;
-    }
-
-    private void OnPlayPauseClicked(object sender, RoutedEventArgs e)
-    {
-        ShowControlsOverlay(autoHide: false);
-
-        if (_mediaPlayer is null)
+        private int NormalizeIndex(int index)
         {
-            PlayCurrentVideo();
-            return;
-        }
-
-        if (_mediaPlayer.IsPlaying)
-        {
-            _mediaPlayer.Pause();
-        }
-        else
-        {
-            if (_currentMedia is null)
+            if (_videos.Count == 0)
             {
-                PlayCurrentVideo();
-            }
-            else
-            {
-                _mediaPlayer.Play();
-            }
-        }
-
-        UpdatePlaybackControls();
-    }
-
-    private void OnNextClicked(object sender, RoutedEventArgs e)
-    {
-        ShowControlsOverlay();
-        AdvanceToNextVideo();
-    }
-
-    private void OnPreviousClicked(object sender, RoutedEventArgs e)
-    {
-        ShowControlsOverlay();
-        GoToPreviousVideo();
-    }
-
-    private void RootGrid_OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (IsInteractiveElement(e.OriginalSource as DependencyObject))
-        {
-            ShowControlsOverlay(autoHide: false);
-            return;
-        }
-
-        if (IsOnResizeBorder(e))
-        {
-            return;
-        }
-
-        ShowControlsOverlay();
-
-        try
-        {
-            DragMove();
-            e.Handled = true;
-        }
-        catch (InvalidOperationException)
-        {
-            // Ignore situations where drag cannot start.
-        }
-    }
-
-    private static bool IsInteractiveElement(DependencyObject? element)
-    {
-        while (element is not null)
-        {
-            if (element is ButtonBase or Slider)
-            {
-                return true;
+                return 0;
             }
 
-            element = VisualTreeHelper.GetParent(element);
+            var modulo = index % _videos.Count;
+            return modulo >= 0 ? modulo : modulo + _videos.Count;
         }
-
-        return false;
     }
 
-    private void UpdateAspectRatioFromPlayer()
+    private sealed class ServerStateResponse
     {
-        if (_mediaPlayer is null)
-        {
-            return;
-        }
-
-        uint width = 0;
-        uint height = 0;
-        var hasSize = _mediaPlayer.Size(0, ref width, ref height);
-        if (hasSize && width > 0 && height > 0)
-        {
-            _videoAspectRatio = width / (double)height;
-            AdjustWindowToAspectRatio();
-        }
+        public required List<VideoDto> Videos { get; init; }
+        public int CurrentIndex { get; init; }
+        public double PositionSeconds { get; init; }
     }
 
-    private void AdjustWindowToAspectRatio()
+    private sealed class SpotUpdatePayload
     {
-        if (!_videoAspectRatio.HasValue || _videoAspectRatio.Value <= 0)
-        {
-            return;
-        }
-
-        var ratio = _videoAspectRatio.Value;
-        var workArea = SystemParameters.WorkArea;
-        const double maxScreenFraction = 0.9;
-
-        var desiredWidth = double.IsNaN(Width) || Width <= 0
-            ? (ActualWidth > 0 ? ActualWidth : 640)
-            : Width;
-
-        var desiredHeight = desiredWidth / ratio;
-
-        if (desiredHeight > workArea.Height * maxScreenFraction)
-        {
-            desiredHeight = workArea.Height * maxScreenFraction;
-            desiredWidth = desiredHeight * ratio;
-        }
-
-        if (desiredWidth > workArea.Width * maxScreenFraction)
-        {
-            desiredWidth = workArea.Width * maxScreenFraction;
-            desiredHeight = desiredWidth / ratio;
-        }
-
-        desiredWidth = Math.Max(MinWidth, desiredWidth);
-        desiredHeight = Math.Max(MinHeight, desiredHeight);
-
-        _isAdjustingSize = true;
-        Width = desiredWidth;
-        Height = desiredHeight;
-        _lastSize = new WindowsSize(Width, Height);
-        _isAdjustingSize = false;
+        public int Index { get; set; }
+        public double PositionSeconds { get; set; }
     }
 
-    private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
-    {
-        if (_isAdjustingSize || !_videoAspectRatio.HasValue)
-        {
-            _lastSize = e.NewSize;
-            return;
-        }
+    private readonly record struct SpotSnapshot(int Index, double PositionSeconds);
 
-        var newWidth = e.NewSize.Width;
-        var newHeight = e.NewSize.Height;
+    private readonly record struct VideoDescriptor(int Index, string Path, string FileName);
 
-        if (newWidth <= 0 || newHeight <= 0)
-        {
-            _lastSize = e.NewSize;
-            return;
-        }
-
-        var ratio = _videoAspectRatio.Value;
-        var workArea = SystemParameters.WorkArea;
-        const double maxScreenFraction = 0.95;
-
-        _isAdjustingSize = true;
-
-        var widthDiff = Math.Abs(newWidth - _lastSize.Width);
-        var heightDiff = Math.Abs(newHeight - _lastSize.Height);
-
-        if (widthDiff >= heightDiff)
-        {
-            newHeight = newWidth / ratio;
-        }
-        else
-        {
-            newWidth = newHeight * ratio;
-        }
-
-        var maxWidth = workArea.Width * maxScreenFraction;
-        var maxHeight = workArea.Height * maxScreenFraction;
-
-        if (newWidth > maxWidth)
-        {
-            newWidth = maxWidth;
-            newHeight = newWidth / ratio;
-        }
-
-        if (newHeight > maxHeight)
-        {
-            newHeight = maxHeight;
-            newWidth = newHeight * ratio;
-        }
-
-        newWidth = Math.Max(MinWidth, newWidth);
-        newHeight = Math.Max(MinHeight, newHeight);
-
-        Width = newWidth;
-        Height = newHeight;
-        _lastSize = new WindowsSize(newWidth, newHeight);
-
-        _isAdjustingSize = false;
-    }
-
-    private void OnTimelineSliderValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
-    {
-        if (_isUpdatingTimeline || _isSliderDragging)
-        {
-            return;
-        }
-
-        SeekToSliderValue();
-    }
-
-    private void TimelineSlider_OnPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        _isSliderDragging = true;
-        _overlayHideTimer.Stop();
-        ShowControlsOverlay(autoHide: false);
-    }
-
-    private void TimelineSlider_OnPreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-    {
-        if (!_isSliderDragging)
-        {
-            return;
-        }
-
-        _isSliderDragging = false;
-        SeekToSliderValue();
-        ShowControlsOverlay();
-    }
-
-    private void OnTimelineSliderLostMouseCapture(object sender, InputMouseEventArgs e)
-    {
-        if (!_isSliderDragging)
-        {
-            return;
-        }
-
-        _isSliderDragging = false;
-        SeekToSliderValue();
-        ShowControlsOverlay();
-    }
-
-    private void SeekToSliderValue()
-    {
-        if (_mediaPlayer is null || !_isSeekable)
-        {
-            return;
-        }
-
-        var target = (float)Math.Clamp(TimelineSlider.Value, TimelineSlider.Minimum, TimelineSlider.Maximum);
-        _mediaPlayer.Position = target;
-    }
-
-    private void RootGrid_OnMouseLeave(object sender, InputMouseEventArgs e)
-    {
-        if (_isSliderDragging)
-        {
-            return;
-        }
-
-        HideControlsOverlay(force: true);
-    }
-
-    private bool IsOnResizeBorder(InputMouseEventArgs e)
-    {
-        var chrome = WindowChrome.GetWindowChrome(this);
-        var border = chrome?.ResizeBorderThickness ?? new Thickness(8);
-        var position = e.GetPosition(this);
-
-        return position.X <= border.Left ||
-               position.X >= ActualWidth - border.Right ||
-               position.Y <= border.Top ||
-               position.Y >= ActualHeight - border.Bottom;
-    }
+    private readonly record struct VideoDto(int Index, string FileName);
 
     private sealed class Win32Window : Forms.IWin32Window
     {
