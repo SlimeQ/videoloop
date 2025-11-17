@@ -525,7 +525,7 @@ public partial class MainWindow : Window
               const info = document.getElementById('info');
               let lastUpdate = 0;
               const updateThrottleMs = 5000;
-              const supportNotes = 'Firefox only enables HEVC (H.265) starting with version 134 on Windows (requires hardware support or Microsoft's HEVC Video Extensions), version 136 on macOS, and version 137 on Linux/Android. See MDN: https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Video_codecs#hevc_h.265';
+              const supportNotes = "Firefox only enables HEVC (H.265) starting with version 134 on Windows (requires hardware support or Microsoft's HEVC Video Extensions), version 136 on macOS, and version 137 on Linux/Android. See MDN: https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Video_codecs#hevc_h.265";
 
               async function fetchState() {
                 const response = await fetch('/api/state', { cache: 'no-store' });
