@@ -1,17 +1,40 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('Windows'))">net9.0-windows;net9.0</TargetFrameworks>
+    <TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('Windows'))">net9.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon Condition="$(TargetFramework.Contains('windows'))">Assets\VideoLoop.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$(TargetFramework.Contains('windows'))">
+    <OutputType>WinExe</OutputType>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="!$(TargetFramework.Contains('windows'))">
+    <OutputType>Exe</OutputType>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="LibVLCSharp.WPF" Version="3.9.4" />
-    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
+    <PackageReference Include="LibVLCSharp.WPF" Version="3.9.4" Condition="$(TargetFramework.Contains('windows'))" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" Condition="$(TargetFramework.Contains('windows'))" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('windows'))">
+    <None Include="Assets\VideoLoop.ico" />
+  </ItemGroup>
+
+  <ItemGroup Condition="!$(TargetFramework.Contains('windows'))">
+    <Compile Remove="App.xaml.cs" />
+    <Compile Remove="MainWindow.xaml.cs" />
+    <Compile Remove="AssemblyInfo.cs" />
+    <Page Remove="App.xaml" />
+    <Page Remove="MainWindow.xaml" />
+    <None Remove="Assets\VideoLoop.ico" />
   </ItemGroup>
 
 </Project>
