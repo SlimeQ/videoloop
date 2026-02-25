@@ -276,7 +276,16 @@ public partial class MainWindow : Window
         });
 
         builder.Services.AddSingleton(coordinator);
-        builder.Services.AddSingleton<FileExtensionContentTypeProvider>();
+        var contentTypeProvider = new FileExtensionContentTypeProvider();
+        contentTypeProvider.Mappings[".mp4"] = "video/mp4";
+        contentTypeProvider.Mappings[".m4v"] = "video/x-m4v";
+        contentTypeProvider.Mappings[".mov"] = "video/quicktime";
+        contentTypeProvider.Mappings[".wmv"] = "video/x-ms-wmv";
+        contentTypeProvider.Mappings[".avi"] = "video/x-msvideo";
+        contentTypeProvider.Mappings[".mpg"] = "video/mpeg";
+        contentTypeProvider.Mappings[".mpeg"] = "video/mpeg";
+        contentTypeProvider.Mappings[".mkv"] = "video/x-matroska";
+        builder.Services.AddSingleton(contentTypeProvider);
 
         var app = builder.Build();
 
